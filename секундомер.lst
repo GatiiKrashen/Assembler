@@ -1,0 +1,854 @@
+Microsoft (R) Macro Assembler Version 6.14.8444		    03/01/26 17:37:16
+ёхъєэфюьхЁ.asm						     Page 1 - 1
+
+
+				.386
+ = 1000				RomSize      EQU   4096 ;размер ПЗУ
+ = 0001				SegPort      EQU   1    ;порт сегментов динамической индикации
+ = 0002				ChoicePort   EQU   2    ;порт выбора индикатора
+ = 0003				RaceDispPort EQU   3    ;порт вывода забега
+ = 0001				BttnPort     EQU   1    ;порт кнопок управления
+ = 0002				TrackInpPort EQU   2    ;порт датчиков дорожек
+ = 0004				TrackLedPort EQU   4    ;порт индикаторов дорожек
+ = 0043				TimerPort_CW EQU   43h  ;порты управления таймером
+ = 0040				TimerPort    EQU   40h
+
+ = 0005				TrackLen     EQU   5    ;длина результата одной дорожки
+ = 0008				RaceLen      EQU   8    ;количество дорожек в забеге
+ = 0004				ResultsLen   EQU   4    ;количтво забегов всего
+ = 0008				ErrorMsgLen  EQU   8    ;длина сообщения об ошибке
+ = 0014				Vibrtime     EQU   20   ;время гашения дребезга
+
+ 0000				IntTable   SEGMENT use16 AT 0
+				            org 0ffh * 4;смещение вектора прерывания таймера
+ 03FC 0000			            IntFFHandlerPtrOffs DW ? 
+ 03FE 0000			            IntFFHandlerPtrSeg  DW ?
+ 0400				IntTable   ENDS
+
+ 0000				Data       SEGMENT use16 AT 400h
+ 0000 00			            BttnPortImg  DB ? ;образ порта кнопок
+ 0001 00			            LastBttnImg  DB ? ;прошлой образ порта кнопок
+ 0002 00			            TrackPortImg DB ? ;образ порта дорожек
+ 0003 00			            LastTrackImg DB ? ;прошлой образ порта дорожек
+
+ 0004 00			            TrackEndFlag DB ? ;флаг срабатывания дорожек
+ 0005 00			            TimeErrFlag  DB ? ;флаг ошибки переполнения времени
+ 0006 00			            RaceErrFlag  DB ? ;флаг ошибки переполнения забегов
+ 0007 00			            StartFlag    DB ? ;флага работы таймера
+ 0008 00			            DispModeFlag DB ? ;флаг режима отображения
+
+ 0009 00			            CurrRace     DB ? ;номер текущего забега
+ 000A 00			            DispRace     DB ? ;номер отображаемого забега
+ 000B 00			            DispTrack    DB ? ;номер отображаемого результата
+
+ 000C  0004 [			            Time         DB 4 DUP(?) ;счетчик времени
+        00
+       ]
+				            ;массив результатов
+ 0010  0004 [			            Results      DB ResultsLen DUP(RaceLen DUP(TrackLen DUP(?)))
+        0008 [
+	 0005 [
+	  00
+	 ]
+	]
+       ]
+ 00B0				Data       ENDS
+
+ 0000				Stk        SEGMENT use16 AT 500h
+ 0000  000A [			           dw    10 dup (?)
+        0000
+       ]
+ 0014				StkTop     Label Word
+ 0014				Stk        ENDS
+
+ 0000				Code       SEGMENT use16
+				           ASSUME cs:Code, ds:Data, es:Data, ss: Stk   
+				           ;таблица образов цифр
+ 0000 3F 0C 76 5E 4D 5B		digits     db 3Fh, 0Ch, 76h, 05Eh, 4Dh, 5Bh, 7Bh, 0Eh, 7Fh, 5Fh 
+       7B 0E 7F 5F
+				           ;сообщение об ошибке
+ 000A 73 60 60 78 60 00		ErrorMsg   db 73h, 60h, 60h, 78h, 60h,    0,    0,    0     
+       00 00
+
+ 0012				Prepfunc PROC ;функциональная подготовка
+				            ;сброс прошлых образов портов
+ 0012  C6 06 0003 R FF		            mov LastTrackImg, 0ffh
+ 0017  C6 06 0001 R FF		            mov LastBttnImg, 0ffh
+				            ;сброс флага работы секундомера
+ 001C  C6 06 0007 R 00		            mov StartFlag, 0
+				            ;обнуление времени
+ 0021  C7 06 000C R 0000	            mov word ptr Time, 0
+ 0027  C7 06 000E R 0000	            mov word ptr Time+2, 0
+				            ;обнуление массива результатов
+ 002D  B9 0050			            mov cx, RaceLen * TrackLen * ResultsLen / 2
+ 0030  8D 36 0010 R		            lea si, Results
+ 0034  C7 04 0000		 pfres:     mov word ptr [si], 0
+ 0038  83 C6 02			            add si, 2
+ 003B  E2 F7			            loop pfres
+				            ;сброс флагов
+ 003D  C6 06 0004 R 00		            mov TrackEndFlag, 0
+ 0042  C6 06 0006 R 00		            mov RaceErrFlag, 0
+ 0047  C6 06 0005 R 00		            mov TimeErrFlag,0
+ 004C  C6 06 0008 R 00		            mov DispModeFlag, 0
+				            ;обнуление номеров забега и дорожек
+ 0051  C6 06 0009 R FF		            mov CurrRace, -1
+ 0056  C6 06 000A R 00		            mov DispRace, 0
+ 005B  C6 06 000B R 00		            mov DispTrack, 0
+
+ 0060				Prepfunc  ENDP
+
+ 0060				InitTimer PROC ;подготовка рабыты таймера
+ 0060  B0 16			           mov   al, 16h             
+ 0062  E6 43			           out   TimerPort_CW, al
+ 0064  B0 02			           mov   al, 2             
+ 0066  E6 40			           out   TimerPort, al
+ 0068  C3			           ret
+ 0069				InitTimer ENDP   
+
+ 0069				VibrContr PROC  ;гашение дребезга кнопок
+ 0069  51			            push cx
+ 006A				 vd_reset:
+ 006A  B9 0014			            mov  cx, Vibrtime
+ 006D				 vd_same_input:        
+ 006D  8A E0			            mov  ah, al
+ 006F  E4 01			            in   al, BttnPort
+
+ 0071  32 E0			            xor  ah, al
+ 0073  75 F5			            jnz  vd_reset
+
+ 0075  E2 F6			            loop vd_same_input
+ 0077  59			            pop  cx
+ 0078  C3			            ret
+ 0079				VibrContr ENDP 
+
+ 0079				BttnInput PROC ;обработка ввода кнопок
+ 0079  E4 01			            in   al, BttnPort
+ 007B  E8 FFEB			            call VibrContr ;гашение дребезга
+ 007E  8A E0			            mov ah, al
+ 0080  0C F0			            or   al, 0f0h ;1111 0000 гашение незначимых битов
+ 0082  32 06 0001 R		            xor al, LastBttnImg ;веделение фронта
+ 0086  22 06 0001 R		            and al, LastBttnImg
+ 008A  A2 0000 R		            mov BttnPortImg, al ;запись образа
+ 008D  88 26 0001 R		            mov LastBttnImg, ah ;запись образа в прошлый
+ 0091  C3			            ret
+ 0092				BttnInput ENDP
+				            
+ 0092				TrackInput PROC;обработка датчиков дорожек
+ 0092  E4 02			            in   al, TrackInpPort ;ввод с порта
+ 0094  8A E0			            mov ah, al
+				            ;выделение фронта
+ 0096  32 06 0003 R		            xor al, LastTrackImg
+ 009A  22 06 0003 R		            and al, LastTrackImg
+				            ;сохранение
+ 009E  A2 0002 R		            mov TrackPortImg, al
+ 00A1  88 26 0003 R		            mov LastTrackImg, ah
+ 00A5  C3			            ret
+ 00A6				TrackInput ENDP
+
+ 00A6				TimeForm PROC ;отсчет времени
+				            ;срабатывает по прерыванию таймера
+				            ;сохранение состояний регистра
+ 00A6  50			            push ax
+				            ;проверка состояния секундомера
+ 00A7  80 3E 0007 R FF		            cmp StartFlag, 0ffh
+ 00AC  75 45			            jnz tfexit ; переход если остановлен
+				            ;инкремент времени
+				            ;обработка миллисекунд
+ 00AE  A0 000F R		            mov al, Time+3
+ 00B1  04 01			            add al, 1
+ 00B3  27			            daa
+ 00B4  A2 000F R		            mov Time+3, al
+				            ;обработка секунд
+ 00B7  A0 000E R		            mov al, Time+2
+ 00BA  14 00			            adc al, 0
+ 00BC  27			            daa
+ 00BD  A2 000E R		            mov Time+2, al
+ 00C0  C0 E8 04			            shr al, 4
+ 00C3  3C 05			            cmp al, 5
+ 00C5  76 2C			            jna tfexit ;выход если переноса нет
+ 00C7  C6 06 000E R 00		            mov Time+2, 0
+				            ;обработка минут
+ 00CC  A0 000D R		            mov al, Time+1
+ 00CF  04 01			            add al, 1
+ 00D1  27			            daa
+ 00D2  A2 000D R		            mov Time+1, al
+ 00D5  C0 E8 04			            shr al, 4
+ 00D8  3C 05			            cmp al, 5
+ 00DA  76 17			            jna tfexit ;выход если переноса нет
+ 00DC  C6 06 000D R 00		            mov Time+1, 0
+				            ;обработка часов
+ 00E1  FE 06 000C R		            inc Time
+ 00E5  80 3E 000C R 09		            cmp Time, 9
+ 00EA  76 07			            jna tfexit
+ 00EC  C6 06 0005 R FF		            mov TimeErrFlag, 0ffh
+ 00F1  EB 00			            jmp tfexit
+ 00F3				 tfexit:    
+				            ;восстановление состояний регистров
+ 00F3  58			            pop ax
+ 00F4  CF			            iret
+ 00F5				TimeForm ENDP
+
+ 00F5				StartForm PROC ;формирование флага работы секундомера
+				            ;проверка ошибок
+ 00F5  A0 0006 R		            mov al, RaceErrFlag
+ 00F8  0A 06 0005 R		            or al, TimeErrFlag
+ 00FC  3C FF			            cmp al, 0ffh
+ 00FE  75 07			            jnz sf_err_skip; переход если ошибок нет
+ 0100  C6 06 0007 R 00		            mov StartFlag, 0 ;остановка секундомера
+ 0105  EB 39			            jmp sfexit
+ 0107				 sf_err_skip:            
+				            ;проверка состояния секундомера
+ 0107  80 3E 0007 R FF		            cmp StartFlag, 0ffh
+ 010C  75 15			            jnz sf_not_started  ;переход если секундомер стоит
+				            
+				            ;секундомер идет
+				            ;проверка если все дорожки уже сработали
+				            ;обновление флага срабатывания дорожек
+ 010E  A0 0002 R		            mov al, TrackPortImg 
+ 0111  08 06 0004 R		            or TrackEndFlag, al
+ 0115  80 3E 0004 R FF		            cmp TrackEndFlag, 0ffh ;проверка флага
+ 011A  75 24			            jnz sfexit ;выход если не все дорожки сработали
+ 011C  C6 06 0007 R 00		            mov StartFlag, 0;остановка секундомера
+ 0121  EB 1D			            jmp sfexit
+ 0123				 sf_not_started:
+				            ;секундомер стоит
+ 0123  C6 06 0004 R 00		            mov TrackEndFlag, 0 ;обнуление флага сработавших дорожек
+				            ;проверка кнопки старта
+ 0128  F6 06 0000 R 01		            test BttnPortImg, 01 ;0000 0001
+ 012D  74 11			            jz  sfexit;выход если кнопка не нажата
+				            ;обнуление таймера
+ 012F  C7 06 000C R 0000	            mov word ptr Time, 0
+ 0135  C7 06 000E R 0000	            mov word ptr Time+2, 0
+ 013B  C6 06 0007 R FF		            mov StartFlag, 0ffh;запуск секундомера
+ 0140				 sfexit:
+ 0140  C3			            ret
+ 0141				StartForm ENDP
+
+ 0141				RaceNumForm PROC ;формирование номера забега
+				            ;проверка состояния секундомера
+ 0141  80 3E 0007 R FF		            cmp StartFlag, 0ffh
+ 0146  74 36			            jz rnfexit ;выход если секундомер идет
+				            ;проверка кнопки старт
+ 0148  F6 06 0000 R 01		            test BttnPortImg, 01 ;0000 0001
+ 014D  74 18			            jz  rnf_start_skip
+				            ;кнопка нажата
+				            ;увеличение текущего забега
+ 014F  FE 06 0009 R		            inc CurrRace
+				            ;смена отображаемого забега
+ 0153  A0 0009 R		            mov al, CurrRace
+ 0156  A2 000A R		            mov DispRace, al
+				            ;проверка ошибки переполения забегов
+ 0159  80 3E 0009 R 04		            cmp CurrRace, 4
+ 015E  75 05			            jnz rnf_err_skip
+ 0160  C6 06 0006 R FF		            mov RaceErrFlag, 0ffh ;поднятие флага ошибки забегов
+ 0165				 rnf_err_skip:
+ 0165  EB 17			            jmp rnfexit
+ 0167				 rnf_start_skip:
+				            ;кнопка старт не нажата
+				            ;проверка кнопки след. забега
+ 0167  F6 06 0000 R 04		            test BttnPortImg, 04 ;0000 0100
+ 016C  74 10			            jz  rnfexit
+				            ;отображение след. забега
+ 016E  FE 06 000A R		            inc DispRace
+				            ;зацикливание больше 4 забегов
+ 0172  80 3E 000A R 04		            cmp DispRace, 4
+ 0177  75 05			            jnz rnfexit
+ 0179  C6 06 000A R 00		            mov DispRace, 0
+ 017E				 rnfexit:
+ 017E  C3			            ret
+ 017F				RaceNumForm ENDP
+
+ 017F				TrackNumForm PROC;формирование номера дорожки
+				            ;проверка состояния секундомера
+ 017F  80 3E 0007 R FF		            cmp StartFlag, 0ffh
+ 0184  74 17			            jz tnfexit ;выход если секундомер идет
+				            ;проверка кнопки след. дорожки
+ 0186  F6 06 0000 R 08		            test BttnPortImg, 08 ;0000 1000
+ 018B  74 10			            jz  tnfexit
+				            ;отображение след. дорожки
+ 018D  FE 06 000B R		            inc DispTrack
+				            ;зацикливание больше 8 дорожек
+ 0191  80 3E 000B R 08		            cmp DispTrack, 8
+ 0196  75 05			            jnz tnfexit
+ 0198  C6 06 000B R 00		            mov DispTrack, 0
+ 019D				 tnfexit:            
+ 019D  C3			            ret
+ 019E				TrackNumForm ENDP
+
+ 019E				DispModeChange PROC ;смена режима отображения
+				            ;проверка состояния секундомера
+ 019E  80 3E 0007 R FF		            cmp StartFlag, 0ffh
+ 01A3  75 07			            jnz dmcpaused
+				            ;секундомер идет
+ 01A5  C6 06 0008 R 00		            mov DispModeFlag, 0 ;режим отображения тек. времени
+ 01AA  EB 0C			            jmp dmcexit
+ 01AC				 dmcpaused: 
+				            ;секундомер стоит
+				            ;проверка срабатывания всех дорожек
+				            ;(т.е. секундомер только что остановился)
+ 01AC  80 3E 0004 R FF		            cmp TrackEndFlag, 0ffh
+ 01B1  75 05			            jnz dmcexit
+ 01B3  C6 06 0008 R FF		            mov DispModeFlag, 0ffh ;режим отображения результатов
+ 01B8				 dmcexit:
+ 01B8  C3			            ret
+ 01B9				DispModeChange ENDP
+
+ 01B9				CurrTimeDisp PROC ;отображение текущего времени
+				            ;проверка ошибок
+ 01B9  A0 0006 R		            mov al, RaceErrFlag
+ 01BC  0A 06 0005 R		            or al, TimeErrFlag
+ 01C0  3C FF			            cmp al, 0ffh
+ 01C2  74 60			            jz ctdexit
+				            ;проверка режима отображения 
+ 01C4  80 3E 0008 R FF		            cmp DispModeFlag, 0ffh
+ 01C9  74 59			            jz ctdexit ;если режим отображ резуль. то выход
+				            ;подготовка массива образов 
+ 01CB  8D 1E 0000 R		            lea  bx, digits
+				            ;статический вывод номера забега
+ 01CF  A0 0009 R		            mov al, CurrRace
+ 01D2  FE C0			            inc al
+ 01D4  2E: D7			            xlat digits
+ 01D6  E6 03			            out RaceDispPort, al
+
+				            ;динамический вывод времени
+				            ;подготовка регистра для выбора индикаторов
+ 01D8  B4 FD			            mov ah, 0FDh ; 1111 1101
+
+				            ;вывод цифры часов
+				            ;чтение часов
+ 01DA  A0 000C R		            mov al, Time
+				            ;табличное преобразование в образ
+ 01DD  2E: D7			            xlat digits
+				            ;вывод на индикатоор
+ 01DF  E6 01			            out SegPort, al
+				            ;включение индикатора часов
+ 01E1  8A C4			            mov al, ah
+ 01E3  E6 02			            out ChoicePort, al
+				            ;выключение всех индикаторов
+ 01E5  B0 FF			            mov al, 0ffh
+ 01E7  E6 02			            out ChoicePort, al
+				            ;сдвиг регистра выбора индикаторов
+				            ;rol ah, 1
+				            ;подготовка цикла
+ 01E9  B9 0003			            mov cx, 3
+ 01EC  8D 36 000D R		            lea si, Time + 1
+ 01F0				 ctd_loop:
+				            ;сдвиг регистра выбора индикаторов
+ 01F0  D0 C4			            rol ah, 1
+				            ;выделение старшей цифры числа
+ 01F2  8A 04			            mov al, [si]
+ 01F4  C0 E8 04			            shr al, 4
+				            ;табличное преобразование в образ
+ 01F7  2E: D7			            xlat digits
+				            ;вывод на индикатоор
+ 01F9  E6 01			            out SegPort, al
+				            ;выбор старшего индикатора
+ 01FB  8A C4			            mov al, ah
+ 01FD  E6 02			            out ChoicePort, al
+				            ;выключение всех индикаторов
+ 01FF  B0 FF			            mov al, 0ffh
+ 0201  E6 02			            out ChoicePort, al
+
+				            ;сдвиг регистра выбора индикаторов
+ 0203  D0 C4			            rol ah, 1
+				            ;выделение младшей цифры числа
+ 0205  8A 04			            mov al, [si]
+ 0207  24 0F			            and al, 0fh
+				            ;табличное преобразование в образ
+ 0209  2E: D7			            xlat digits
+				            ;вывод на индикатоор
+ 020B  E6 01			            out SegPort, al
+				            ;выбор младшего индикатора
+ 020D  8A C4			            mov al, ah
+ 020F  E6 02			            out ChoicePort, al
+				            ;выключение всех индикаторов
+ 0211  B0 FF			            mov al, 0ffh
+ 0213  E6 02			            out ChoicePort, al
+
+				            ;модификация адреса источника
+ 0215  46			            inc si
+ 0216  E2 D8			            loop ctd_loop
+
+				            ;вывод точки после секунд
+ 0218  B0 80			            mov al, 80h;1000 0000
+ 021A  E6 01			            out SegPort, al
+				            ;выбор индикатора секунд
+ 021C  B0 DF			            mov al, 0DFh ;1101 1111
+ 021E  E6 02			            out ChoicePort, al
+				            ;выключение всех индикаторов
+ 0220  B0 FF			            mov al, 0ffh
+ 0222  E6 02			            out ChoicePort, al
+
+ 0224				 ctdexit:
+ 0224  C3			            ret
+ 0225				CurrTimeDisp ENDP
+
+ 0225				ResultDisp PROC ;отображение сохраненных результатов
+				            ;проверка ошибок
+ 0225  A0 0006 R		            mov al, RaceErrFlag
+ 0228  0A 06 0005 R		            or al, TimeErrFlag
+ 022C  3C FF			            cmp al, 0ffh
+ 022E  0F 84 0085		            jz rdexit
+				            ;проверка режима вывода 
+ 0232  80 3E 0008 R FF		            cmp DispModeFlag, 0ffh
+ 0237  75 7E			            jnz rdexit ;если режим текущего врем. то выход
+				            ;адрес конкретного результата в будет si
+ 0239  8D 36 0010 R		            lea si, Results
+				            ;смещение не текущий забег
+ 023D  B0 28			            mov al, RaceLen * TrackLen
+ 023F  F6 26 000A R		            mul DispRace
+ 0243  32 E4			            xor ah, ah
+ 0245  03 F0			            add si, ax
+				            ;смещение на текущую дорожку
+ 0247  B0 05			            mov al, TrackLen
+ 0249  F6 26 000B R		            mul DispTrack
+ 024D  32 E4			            xor ah, ah
+ 024F  03 F0			            add si, ax
+
+				            ;вывод 
+				            ;подготовка массива образов 
+ 0251  8D 1E 0000 R		            lea  bx, digits
+
+				            ;статический вывод номера забега
+ 0255  A0 000A R		            mov al, DispRace
+ 0258  FE C0			            inc al
+ 025A  2E: D7			            xlat digits
+ 025C  E6 03			            out RaceDispPort, al
+
+				            ;динамический вывод времени и номера дорожки
+				            ;подготовка регистра для выбора индикаторов
+ 025E  B4 FE			            mov ah, 0FEh ; 1111 1110
+
+				            ;вывод цифры номера дорожки
+				            ;чтение номера дорожки
+ 0260  8A 04			            mov al, [si]
+				            ;табличное преобразование в образ
+ 0262  2E: D7			            xlat digits
+				            ;вывод на индикатоор
+ 0264  E6 01			            out SegPort, al
+				            ;включение индикатора номера дорожки
+ 0266  8A C4			            mov al, ah
+ 0268  E6 02			            out ChoicePort, al
+				            ;выключение всех индикаторов
+ 026A  B0 FF			            mov al, 0ffh
+ 026C  E6 02			            out ChoicePort, al
+				            ;сдвиг регистра выбора индикаторов
+ 026E  D0 C4			            rol ah, 1
+ 0270  46			            inc si
+				            ;вывод цифры часов
+				            ;чтение часов
+ 0271  8A 04			            mov al, [si]
+				            ;табличное преобразование в образ
+ 0273  2E: D7			            xlat digits
+				            ;вывод на индикатоор
+ 0275  E6 01			            out SegPort, al
+				            ;включение индикатора часов
+ 0277  8A C4			            mov al, ah
+ 0279  E6 02			            out ChoicePort, al
+				            ;выключение всех индикаторов
+ 027B  B0 FF			            mov al, 0ffh
+ 027D  E6 02			            out ChoicePort, al
+				            ;сдвиг регистра выбора индикаторов
+				            ;rol ah, 1
+ 027F  46			            inc si
+
+ 0280  B9 0003			            mov cx, 3
+ 0283				  rd_loop:
+				            ;сдвиг регистра выбора индикаторов
+ 0283  D0 C4			            rol ah, 1
+				            ;выделение старшей цифры числа
+ 0285  8A 04			            mov al, [si]
+ 0287  C0 E8 04			            shr al, 4
+				            ;табличное преобразование в образ
+ 028A  2E: D7			            xlat digits
+				            ;вывод на индикатоор
+ 028C  E6 01			            out SegPort, al
+				            ;выбор старшего индикатора
+ 028E  8A C4			            mov al, ah
+ 0290  E6 02			            out ChoicePort, al
+				            ;выключение всех индикаторов
+ 0292  B0 FF			            mov al, 0ffh
+ 0294  E6 02			            out ChoicePort, al
+
+				            ;сдвиг регистра выбора индикаторов
+ 0296  D0 C4			            rol ah, 1
+				            ;выделение младшей цифры числа
+ 0298  8A 04			            mov al, [si]
+ 029A  24 0F			            and al, 0fh
+				            ;табличное преобразование в образ
+ 029C  2E: D7			            xlat digits
+				            ;вывод на индикатоор
+ 029E  E6 01			            out SegPort, al
+				            ;выбор младшего индикатора
+ 02A0  8A C4			            mov al, ah
+ 02A2  E6 02			            out ChoicePort, al
+				            ;выключение всех индикаторов
+ 02A4  B0 FF			            mov al, 0ffh
+ 02A6  E6 02			            out ChoicePort, al
+
+				            ;модификация адреса источника
+ 02A8  46			            inc si
+ 02A9  E2 D8			            loop rd_loop
+
+				            ;вывод точки после секунд
+ 02AB  B0 80			            mov al, 80h;1000 0000
+ 02AD  E6 01			            out SegPort, al
+				            ;выбор индикатора секунд
+ 02AF  B0 DF			            mov al, 0DFh ;1101 1111
+ 02B1  E6 02			            out ChoicePort, al
+				            ;выключение всех индикаторов
+ 02B3  B0 FF			            mov al, 0ffh
+ 02B5  E6 02			            out ChoicePort, al
+ 02B7				 rdexit:            
+ 02B7  C3			            ret
+ 02B8				ResultDisp ENDP
+
+ 02B8				ErrorDisp PROC ;вывод сообщение об ошибке
+				            ;проверка ошибок
+ 02B8  A0 0006 R		            mov al, RaceErrFlag
+ 02BB  0A 06 0005 R		            or al, TimeErrFlag
+ 02BF  3C FF			            cmp al, 0ffh
+ 02C1  75 1F			            jnz edexit ; если ошибок нет - выход     
+				            ;очистка индикатора номера забега
+ 02C3  B0 00			            mov al, 0
+ 02C5  E6 03			            out RaceDispPort, al
+				            ;подготовка к выводу сообщения
+ 02C7  B4 FE			            mov ah, 0FEh ; 1111 1110
+ 02C9  8D 36 000A R		            lea si, ErrorMsg
+ 02CD  B9 0008			            mov cx, ErrorMsgLen
+ 02D0				 ed_loop:          
+ 02D0  2E: 8A 04		            mov al, cs:[si] ;вывод символа
+ 02D3  E6 01			            out SegPort, al
+				            ;выбор индикатора
+ 02D5  8A C4			            mov al, ah
+ 02D7  E6 02			            out ChoicePort, al
+				            ;выключение всех индикаторов
+ 02D9  B0 FF			            mov al, 0ffh
+ 02DB  E6 02			            out ChoicePort, al
+				            ;модификация адреса источника
+ 02DD  46			            inc si
+ 02DE  D0 C4			            rol ah, 1
+ 02E0  E2 EE			            loop ed_loop
+ 02E2				 edexit:
+ 02E2  C3			            ret
+ 02E3				ErrorDisp ENDP
+
+ 02E3				TrackDisp PROC ;вывод сработавших датчиков дорожек
+				            ;проверка ошибок
+ 02E3  A0 0006 R		            mov al, RaceErrFlag
+ 02E6  0A 06 0005 R		            or al, TimeErrFlag
+ 02EA  3C FF			            cmp al, 0ffh
+ 02EC  74 0E			            jz td_off
+				            ;проверка режима вывода 
+ 02EE  80 3E 0008 R FF		            cmp DispModeFlag, 0ffh
+ 02F3  74 07			            jz td_off ;если режим отображ резуль. то выключить
+				            
+ 02F5  A0 0004 R		            mov al, TrackEndFlag
+ 02F8  E6 04			            out TrackLedPort, al 
+ 02FA  EB 04			            jmp tdexit
+ 02FC				 td_off:
+ 02FC  B0 00			            mov al, 0
+ 02FE  E6 04			            out TrackLedPort, al 
+ 0300				 tdexit:
+ 0300  C3			            ret
+ 0301				TrackDisp ENDP
+
+ 0301				ResetResults PROC ;сброс резулльтатов
+				            ;проверка состояния секундомера
+ 0301  80 3E 0007 R FF		            cmp StartFlag, 0ffh
+ 0306  74 4B			            jz rrexit ;если время идет то выход
+				            ;проверка кнопки сброса
+ 0308  F6 06 0000 R 02		            test BttnPortImg, 02 ;0000 0010
+ 030D  74 44			            jz rrexit
+				            ;если не нажата - выход
+
+				            ;обнуление результатов
+ 030F  B9 0050			            mov cx, RaceLen * TrackLen * ResultsLen / 2
+ 0312  8D 36 0010 R		            lea si, Results
+ 0316				 rr_loop:
+ 0316  C7 04 0000		            mov word ptr [si], 0
+ 031A  83 C6 02			            add si, 2
+ 031D  E2 F7			            loop rr_loop
+
+				            ;сброс времени
+ 031F  C7 06 000C R 0000	            mov word ptr Time, 0
+ 0325  C7 06 000E R 0000	            mov word ptr Time+2, 0
+				            ;обнуление переменных и флагов
+ 032B  C6 06 0003 R FF		            mov LastTrackImg, 0ffh
+ 0330  C6 06 0001 R FF		            mov LastBttnImg, 0ffh
+ 0335  C6 06 0007 R 00		            mov StartFlag, 0
+
+ 033A  C6 06 0006 R 00		            mov RaceErrFlag, 0
+ 033F  C6 06 0005 R 00		            mov TimeErrFlag, 0
+				            
+ 0344  C6 06 0009 R FF		            mov CurrRace, -1
+ 0349  C6 06 000A R 00		            mov DispRace, 0
+ 034E  C6 06 000B R 00		            mov DispTrack, 0
+ 0353				 rrexit:    
+ 0353  C3			            ret           
+ 0354				ResetResults ENDP
+
+ 0354				SaveResult PROC ;сохранение результатов
+				            ;проверка состояния секундомера
+ 0354  80 3E 0007 R FF		            cmp StartFlag, 0ffh
+ 0359  75 3B			            jnz srexit ;если время не идет то выход
+				            ;подготовка цикла
+ 035B  B9 0008			            mov cx, RaceLen
+				            ;установка di на начало текущего забега
+ 035E  8D 3E 0010 R		            lea di, Results
+ 0362  B0 28			            mov al, RaceLen * TrackLen
+ 0364  F6 26 0009 R		            mul CurrRace
+ 0368  32 E4			            xor ah, ah
+ 036A  03 F8			            add di, ax
+
+ 036C  8A 36 0002 R		            mov dh, TrackPortImg ;образ порта датчиков
+ 0370  B2 01			            mov dl, 1;номер дорожки
+ 0372				 sr_loop:
+ 0372  D0 EE			            shr dh, 1 ;выделение бита 
+ 0374  73 19			            jnc sr_next_loop; пропуск если бит порта = 0
+				            ;проверка пустой записи
+ 0376  8B 45 01			            mov ax, word ptr [di+1]
+ 0379  0B 45 03			            or ax, word ptr [di+3]
+ 037C  83 F8 00			            cmp ax, 0
+ 037F  75 0E			            jnz sr_next_loop ;пропуск если в записи уже что то есть
+				            ;запись номера дорожки
+ 0381  88 15			            mov [di], dl           
+				            ;записть времени
+ 0383  A1 000C R		            mov ax, word ptr Time
+ 0386  89 45 01			            mov [di+1], ax
+ 0389  A1 000E R		            mov ax, word ptr Time + 2
+ 038C  89 45 03			            mov [di+3], ax
+ 038F				 sr_next_loop:
+ 038F  83 C7 05			            add di, TrackLen
+ 0392  FE C2			            inc dl
+ 0394  E2 DC			            loop sr_loop
+ 0396				 srexit:
+ 0396  C3			            ret
+ 0397				SaveResult ENDP
+
+ 0397				RaceSort PROC ;сортировка результатов забега
+				            ;проверка срабатывания всех дорожек
+ 0397  80 3E 0004 R FF		            cmp TrackEndFlag, 0ffh
+ 039C  75 60			            jnz rsexit ;если сработали не все дорожки - выход
+
+				            ;подготовка
+				            ;установка адреса текущего забега
+ 039E  8D 3E 0010 R		            lea di, Results
+ 03A2  B0 28			            mov al, RaceLen * TrackLen
+ 03A4  F6 26 0009 R		            mul CurrRace
+ 03A8  32 E4			            xor ah, ah
+ 03AA  03 F8			            add di, ax
+
+ 03AC  B9 0007			            mov cx, RaceLen-1 ;счетчик внешного цикла
+ 03AF				 rs_out_loop:
+ 03AF  51			            push cx
+ 03B0  B9 0007			            mov cx, RaceLen-1 ;счетчик внутреннего цикла
+ 03B3  8B F7			            mov si, di
+ 03B5				 rs_in_loop:
+				            ;сравнение 2х элементов
+				            
+				            ; сравнение часов
+ 03B5  8A 44 01			            mov al, [si+1]
+ 03B8  3A 44 06			            cmp al, [si+1+TrackLen]
+ 03BB  77 20			            ja rs_swap ;переход к смене если больше
+ 03BD  72 37			            jb rs_swap_skip ;переход к след. эл. если меньше
+				            ; сравнение минут
+ 03BF  8A 44 02			            mov al, [si+2]
+ 03C2  3A 44 07			            cmp al, [si+2+TrackLen]
+ 03C5  77 16			            ja rs_swap ;переход к смене если больше
+ 03C7  72 2D			            jb rs_swap_skip ;переход к след. эл. если меньше
+				            ; сравнение секунд
+ 03C9  8A 44 03			            mov al, [si+3]
+ 03CC  3A 44 08			            cmp al, [si+3+TrackLen]
+ 03CF  77 0C			            ja rs_swap ;переход к смене если больше
+ 03D1  72 23			            jb rs_swap_skip ;переход к след. эл. если меньше
+				            ; сравнение сотых секунд
+ 03D3  8A 44 04			            mov al, [si+4]
+ 03D6  3A 44 09			            cmp al, [si+4+TrackLen]
+ 03D9  77 02			            ja rs_swap ;переход к смене если больше
+ 03DB  EB 19			            jmp rs_swap_skip ;переход к след. эл.
+
+ 03DD				 rs_swap:   ;замена элементов
+				            ;смена номеров дорожек
+ 03DD  8A 04			            mov al, [si]
+ 03DF  86 44 05			            xchg al, [si+TrackLen]
+ 03E2  88 04			            mov [si], al 
+				            ;смена часов и минут
+ 03E4  8B 44 01			            mov ax, word ptr [si+1]
+ 03E7  87 44 06			            xchg ax, word ptr [si+TrackLen+1]
+ 03EA  89 44 01			            mov word ptr [si+1], ax 
+				            ;смена секунд и сотых секунд
+ 03ED  8B 44 03			            mov ax, word ptr [si+3]
+ 03F0  87 44 08			            xchg ax, word ptr [si+TrackLen+3]
+ 03F3  89 44 03			            mov word ptr [si+3], ax 
+ 03F6				 rs_swap_skip:
+ 03F6  83 C6 05			            add si, TrackLen;переход к следующей паре элементов
+ 03F9  E2 BA			            loop rs_in_loop;внутренний цикл
+
+ 03FB  59			            pop cx
+ 03FC  E2 B1			            loop rs_out_loop;внешний цикл
+ 03FE				 rsexit:
+ 03FE  C3			            ret
+ 03FF				RaceSort ENDP
+
+ 03FF				Start:  
+				        ;программная подготовка
+ 03FF  FA			            cli ;запрет прерывания
+ 0400  B8 ---- R		            mov   ax, Data
+ 0403  8E D8			            mov   ds, ax
+ 0405  8E C0			            mov   es, ax
+ 0407  B8 ---- R		            mov   ax, Stk
+ 040A  8E D0			            mov   ss, ax
+ 040C  8D 26 0014 R		            lea   sp, StkTop
+				            ;установка процедуры отсчета времени
+				            ;в вектор прерывания таймера
+ 0410  1E			            push  ds
+ 0411  B8 ---- R		            mov   ax, IntTable
+ 0414  8E D8			            mov   ds, ax
+ 0416  B8 00A6 R		            mov   ax, cs:TimeForm
+ 0419  A3 03FC R		            mov   ds:IntFFHandlerPtrOffs, ax
+ 041C  B8 ---- R		            mov   ax, Code
+ 041F  A3 03FE R		            mov   ds:IntFFHandlerPtrSeg, ax
+ 0422  1F			            pop   ds
+
+ 0423  E8 FBEC			            call Prepfunc
+ 0426  E8 FC37			            call InitTimer
+ 0429  FB			            sti ;разрешение прерывания
+ 042A				 main_loop:
+ 042A  E8 FC4C			            call BttnInput
+ 042D  E8 FC62			            call TrackInput
+
+ 0430  E8 FF21			            call SaveResult
+ 0433  E8 FD0B			            call RaceNumForm
+				            
+ 0436  E8 FCBC			            call StartForm
+ 0439  E8 FD43			            call TrackNumForm
+ 043C  E8 FD5F			            call DispModeChange
+				            
+ 043F  E8 FEBF			            call ResetResults
+ 0442  E8 FF52			            call RaceSort
+				            
+ 0445  E8 FD71			            call CurrTimeDisp
+ 0448  E8 FDDA			            call ResultDisp
+ 044B  E8 FE6A			            call ErrorDisp
+ 044E  E8 FE92			            call TrackDisp
+
+ 0451  EB D7			            jmp main_loop
+				        ;смещение стартовой точки
+				            org   RomSize-16
+				            ASSUME cs:NOTHING
+ 0FF0  EA ---- 03FF R		            jmp   Far Ptr Start
+ 0FF5				Code       ENDS
+				END		Start
+Microsoft (R) Macro Assembler Version 6.14.8444		    03/01/26 17:37:16
+ёхъєэфюьхЁ.asm						     Symbols 2 - 1
+
+
+
+
+Segments and Groups:
+
+                N a m e                 Size     Length   Align   Combine Class
+
+Code . . . . . . . . . . . . . .	16 Bit	 0FF5	  Para	  Private 
+Data . . . . . . . . . . . . . .	16 Bit	 00B0	  Abs	  Private 
+IntTable . . . . . . . . . . . .	16 Bit	 0400	  Abs	  Private 
+Stk  . . . . . . . . . . . . . .	16 Bit	 0014	  Abs	  Private 
+
+
+Procedures,  parameters and locals:
+
+                N a m e                 Type     Value    Attr
+
+BttnInput  . . . . . . . . . . .	P Near	 0079	  Code	Length= 0019 Public
+CurrTimeDisp . . . . . . . . . .	P Near	 01B9	  Code	Length= 006C Public
+  ctd_loop . . . . . . . . . . .	L Near	 01F0	  Code	
+  ctdexit  . . . . . . . . . . .	L Near	 0224	  Code	
+DispModeChange . . . . . . . . .	P Near	 019E	  Code	Length= 001B Public
+  dmcpaused  . . . . . . . . . .	L Near	 01AC	  Code	
+  dmcexit  . . . . . . . . . . .	L Near	 01B8	  Code	
+ErrorDisp  . . . . . . . . . . .	P Near	 02B8	  Code	Length= 002B Public
+  ed_loop  . . . . . . . . . . .	L Near	 02D0	  Code	
+  edexit . . . . . . . . . . . .	L Near	 02E2	  Code	
+InitTimer  . . . . . . . . . . .	P Near	 0060	  Code	Length= 0009 Public
+Prepfunc . . . . . . . . . . . .	P Near	 0012	  Code	Length= 004E Public
+  pfres  . . . . . . . . . . . .	L Near	 0034	  Code	
+RaceNumForm  . . . . . . . . . .	P Near	 0141	  Code	Length= 003E Public
+  rnf_err_skip . . . . . . . . .	L Near	 0165	  Code	
+  rnf_start_skip . . . . . . . .	L Near	 0167	  Code	
+  rnfexit  . . . . . . . . . . .	L Near	 017E	  Code	
+RaceSort . . . . . . . . . . . .	P Near	 0397	  Code	Length= 0068 Public
+  rs_out_loop  . . . . . . . . .	L Near	 03AF	  Code	
+  rs_in_loop . . . . . . . . . .	L Near	 03B5	  Code	
+  rs_swap  . . . . . . . . . . .	L Near	 03DD	  Code	
+  rs_swap_skip . . . . . . . . .	L Near	 03F6	  Code	
+  rsexit . . . . . . . . . . . .	L Near	 03FE	  Code	
+ResetResults . . . . . . . . . .	P Near	 0301	  Code	Length= 0053 Public
+  rr_loop  . . . . . . . . . . .	L Near	 0316	  Code	
+  rrexit . . . . . . . . . . . .	L Near	 0353	  Code	
+ResultDisp . . . . . . . . . . .	P Near	 0225	  Code	Length= 0093 Public
+  rd_loop  . . . . . . . . . . .	L Near	 0283	  Code	
+  rdexit . . . . . . . . . . . .	L Near	 02B7	  Code	
+SaveResult . . . . . . . . . . .	P Near	 0354	  Code	Length= 0043 Public
+  sr_loop  . . . . . . . . . . .	L Near	 0372	  Code	
+  sr_next_loop . . . . . . . . .	L Near	 038F	  Code	
+  srexit . . . . . . . . . . . .	L Near	 0396	  Code	
+StartForm  . . . . . . . . . . .	P Near	 00F5	  Code	Length= 004C Public
+  sf_err_skip  . . . . . . . . .	L Near	 0107	  Code	
+  sf_not_started . . . . . . . .	L Near	 0123	  Code	
+  sfexit . . . . . . . . . . . .	L Near	 0140	  Code	
+TimeForm . . . . . . . . . . . .	P Near	 00A6	  Code	Length= 004F Public
+  tfexit . . . . . . . . . . . .	L Near	 00F3	  Code	
+TrackDisp  . . . . . . . . . . .	P Near	 02E3	  Code	Length= 001E Public
+  td_off . . . . . . . . . . . .	L Near	 02FC	  Code	
+  tdexit . . . . . . . . . . . .	L Near	 0300	  Code	
+TrackInput . . . . . . . . . . .	P Near	 0092	  Code	Length= 0014 Public
+TrackNumForm . . . . . . . . . .	P Near	 017F	  Code	Length= 001F Public
+  tnfexit  . . . . . . . . . . .	L Near	 019D	  Code	
+VibrContr  . . . . . . . . . . .	P Near	 0069	  Code	Length= 0010 Public
+  vd_reset . . . . . . . . . . .	L Near	 006A	  Code	
+  vd_same_input  . . . . . . . .	L Near	 006D	  Code	
+
+
+Symbols:
+
+                N a m e                 Type     Value    Attr
+
+BttnPortImg  . . . . . . . . . .	Byte	 0000	  Data	
+BttnPort . . . . . . . . . . . .	Number	 0001h	 
+ChoicePort . . . . . . . . . . .	Number	 0002h	 
+CurrRace . . . . . . . . . . . .	Byte	 0009	  Data	
+DispModeFlag . . . . . . . . . .	Byte	 0008	  Data	
+DispRace . . . . . . . . . . . .	Byte	 000A	  Data	
+DispTrack  . . . . . . . . . . .	Byte	 000B	  Data	
+ErrorMsgLen  . . . . . . . . . .	Number	 0008h	 
+ErrorMsg . . . . . . . . . . . .	Byte	 000A	  Code	
+IntFFHandlerPtrOffs  . . . . . .	Word	 03FC	  IntTable	
+IntFFHandlerPtrSeg . . . . . . .	Word	 03FE	  IntTable	
+LastBttnImg  . . . . . . . . . .	Byte	 0001	  Data	
+LastTrackImg . . . . . . . . . .	Byte	 0003	  Data	
+RaceDispPort . . . . . . . . . .	Number	 0003h	 
+RaceErrFlag  . . . . . . . . . .	Byte	 0006	  Data	
+RaceLen  . . . . . . . . . . . .	Number	 0008h	 
+ResultsLen . . . . . . . . . . .	Number	 0004h	 
+Results  . . . . . . . . . . . .	Byte	 0010	  Data	
+RomSize  . . . . . . . . . . . .	Number	 1000h	 
+SegPort  . . . . . . . . . . . .	Number	 0001h	 
+StartFlag  . . . . . . . . . . .	Byte	 0007	  Data	
+Start  . . . . . . . . . . . . .	L Near	 03FF	  Code	
+StkTop . . . . . . . . . . . . .	Word	 0014	  Stk	
+TimeErrFlag  . . . . . . . . . .	Byte	 0005	  Data	
+TimerPort_CW . . . . . . . . . .	Number	 0043h	 
+TimerPort  . . . . . . . . . . .	Number	 0040h	 
+Time . . . . . . . . . . . . . .	Byte	 000C	  Data	
+TrackEndFlag . . . . . . . . . .	Byte	 0004	  Data	
+TrackInpPort . . . . . . . . . .	Number	 0002h	 
+TrackLedPort . . . . . . . . . .	Number	 0004h	 
+TrackLen . . . . . . . . . . . .	Number	 0005h	 
+TrackPortImg . . . . . . . . . .	Byte	 0002	  Data	
+Vibrtime . . . . . . . . . . . .	Number	 0014h	 
+digits . . . . . . . . . . . . .	Byte	 0000	  Code	
+main_loop  . . . . . . . . . . .	L Near	 042A	  Code	
+
+	   0 Warnings
+	   0 Errors
